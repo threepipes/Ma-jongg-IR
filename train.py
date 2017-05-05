@@ -93,16 +93,23 @@ def make_batch(train_data):
 
 
 def train():
+    if len(sys.argv) > 1:
+        gpu = sys.argv[1]
+    else:
+        gpu = -1
     train_data = load('../data')
 
     model = Alex()
+    if gpu >= 0:
+        chainer.cuda.get_device(gpu).use()  # Make a specified GPU current
+        model.to_gpu()  # Copy the model to the GPU
     serializers.load_npz('my.model', model)
 
     optimizer = chainer.optimizers.Adam()
     optimizer.setup(model)
 
     train_iter = chainer.iterators.SerialIterator(train_data, 20)
-    updater = training.StandardUpdater(train_iter, optimizer, device=-1)
+    updater = training.StandardUpdater(train_iter, optimizer, device=gpu)
     epoch = 250
     trainer = training.Trainer(updater, (epoch, 'epoch'), 'result')
 
