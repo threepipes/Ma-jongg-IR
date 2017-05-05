@@ -1,0 +1,17 @@
+/__pycache__/
+/chu/
+/haku/
+/hatsu/
+/m/
+/nan/
+/p/
+/pei/
+/result/
+/s/
+/sha/
+/ton/
+
+*.7z
+*.txt
+*.npy
+*.model
