@@ -5,19 +5,21 @@ from PIL import Image
 
 import matplotlib
 import chainer
+import chainer.cuda as ccuda
 import chainer.functions as F
 import chainer.links as L
 from chainer import training, serializers
 from chainer.training import extensions
+import cupy
 
 from model import Alex
 
 matplotlib.use('Agg')
 
-def convert(image):
+def convert(image, xp):
     if image.mode == 'RGB':
         image = image.convert('RGBA')
-    pixels = np.asarray(image).astype(np.float32)
+    pixels = xp.asarray(image).astype(xp.float32)
     pixels = pixels[:, :, ::-1]
     pixels = pixels.transpose(2, 0, 1)
     return pixels[1:]
@@ -33,16 +35,17 @@ def label2vec(label_list, n):
 
 
 def load_test(path):
+    mean = load_mean()
     data_list = []
     for filename in sorted(os.listdir(path)):
         img_path = os.path.join(path, filename)
-        data = convert(Image.open(img_path))
-        data_list.append(data / 255)
+        data = convert(Image.open(img_path), np)
+        data_list.append((data - mean) / 255)
     return np.asarray(data_list)
 
 
-def load(path):
-    # mean = load_mean()
+def load(path, xp):
+    mean = load_mean(gpu=True)
     data_list = []
     label_list = []
     label_size = 0
@@ -52,37 +55,28 @@ def load(path):
             filename = line[0]
             label = int(line[1])
             target = os.path.join(path, filename)
-            data = convert(Image.open(target))
-            data_list.append(data / 255)
-            # data_list.append((data - mean) / 255)
+            data = convert(Image.open(target), xp)
+            # data_list.append(data / 255)
+            data_list.append((data - mean) / 255)
             label_list.append(label)
             label_size = max(label_size, label + 1)
     # label_list = label2vec(label_list, label_size)
     result = []
     for data, label in zip(data_list, label_list):
         result.append((
-            np.asarray(data).astype(np.float32),
-            label # np.asarray(label).astype(np.int32)
+            xp.asarray(data).astype(xp.float32),
+            xp.asarray(label) # np.asarray(label).astype(np.int32)
         ))
     return result
 
 
-def make_label_dict(label_list):
-    labels = sorted(list(set(label_list)))
-    dic = {}
-    for i, label in enumerate(labels):
-        dic[label] = i
-    import json
-    with open('label_table.txt', 'w') as f:
-        f.write(json.dumps(labels))
-    with open('label.txt', 'w') as f:
-        f.write(json.dumps(dic))
-
-
-def load_mean():
+def load_mean(gpu=False):
     mean = np.load('mean.npy')
     mean = mean[::-1][1:]
-    return mean
+    if gpu:
+        return chainer.cuda.to_gpu(mean)
+    else:
+        return mean
 
 
 def make_batch(train_data):
@@ -94,53 +88,61 @@ def make_batch(train_data):
 
 def train():
     if len(sys.argv) > 1:
-        gpu = sys.argv[1]
+        gpu = int(sys.argv[1])
     else:
         gpu = -1
-    train_data = load('../data')
+    train_data = load('../data', cupy)
 
     model = Alex()
+    classifier = L.Classifier(model)
     if gpu >= 0:
         chainer.cuda.get_device(gpu).use()  # Make a specified GPU current
-        model.to_gpu()  # Copy the model to the GPU
-    serializers.load_npz('my.model', model)
+        model.to_gpu(gpu)  # Copy the model to the GPU
+    # serializers.load_npz('my.model', model)
 
     optimizer = chainer.optimizers.Adam()
-    optimizer.setup(model)
+    optimizer.setup(classifier)
 
-    train_iter = chainer.iterators.SerialIterator(train_data, 20)
+    train_size = int(len(train_data) * 0.8)
+    test_size = len(train_data) - train_size
+
+    train_iter = chainer.iterators.SerialIterator(train_data[:train_size], 20)
+    test_iter = chainer.iterators.SerialIterator(train_data[train_size:], 20,
+                                                 repeat=False, shuffle=False)
     updater = training.StandardUpdater(train_iter, optimizer, device=gpu)
-    epoch = 250
+    epoch = 200
     trainer = training.Trainer(updater, (epoch, 'epoch'), 'result')
 
-    # trainer.extend(extensions.Evaluator(test_iter, model))
-    # trainer.extend(extensions.dump_graph('main/loss'))
-    # frequency = epoch
-    # trainer.extend(extensions.snapshot(), trigger=(frequency, 'epoch'))
+    trainer.extend(extensions.Evaluator(test_iter, classifier))
+    trainer.extend(extensions.dump_graph('main/loss'))
+    frequency = epoch
+    trainer.extend(extensions.snapshot(), trigger=(frequency, 'epoch'))
+    trainer.extend(extensions.LogReport())
 
-    # if extensions.PlotReport.available():
-    #     trainer.extend(
-    #         extensions.PlotReport(['main/loss', 'validation/main/loss'],
-    #                               'epoch', file_name='loss.png'))
-    #     trainer.extend(
-    #         extensions.PlotReport(
-    #             ['main/accuracy', 'validation/main/accuracy'],
-    #             'epoch', file_name='accuracy.png'))
+    if extensions.PlotReport.available():
+        trainer.extend(
+            extensions.PlotReport(['main/loss', 'validation/main/loss'],
+                                  'epoch', file_name='loss.png'))
+        trainer.extend(
+            extensions.PlotReport(
+                ['main/accuracy', 'validation/main/accuracy'],
+                'epoch', file_name='accuracy.png'))
 
-    # trainer.extend(extensions.PrintReport(
-    #     ['epoch', 'main/loss', 'validation/main/loss',
-    #      'main/accuracy', 'validation/main/accuracy', 'elapsed_time']))
+    trainer.extend(extensions.PrintReport(
+        ['epoch', 'main/loss', 'validation/main/loss',
+         'main/accuracy', 'validation/main/accuracy', 'elapsed_time']))
 
     # # Print a progress bar to stdout
-    trainer.extend(extensions.ProgressBar(update_interval=10))
+    trainer.extend(extensions.ProgressBar(update_interval=100))
 
+    print('begin train')
     # Run the training
     trainer.run()
     # alex = Alex()
     # x, t = make_batch(train_data)
     # loss = alex(x, t)
     # print(loss.data)
-    serializers.save_npz('my.model', model)
+    serializers.save_npz('my_3.model', model)
 
     # train, test = chainer.datasets.get_mnist()
 
@@ -148,7 +150,7 @@ def train():
 def predict():
     model = Alex()
     # load
-    serializers.load_npz('my.model', model)
+    serializers.load_npz('my_3.model', model)
     test_data = load_test('../test_data')
 
     import json
@@ -174,5 +176,5 @@ def predict():
 
 
 if __name__ == '__main__':
-    train()
-    # predict()
+    # train()
+    predict()
